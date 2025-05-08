@@ -6,7 +6,7 @@ const fs = require('fs');
 const ipsRoutes = require('./routes/ipsRoutes');
 const idsRoutes = require('./routes/idsRoutes');
 require('dotenv').config(); 
-
+app.set('trust proxy', true); // Enable if behind proxy (like Render)
 // Configuration 
 const API_KEY = process.env.API_KEY;
 const PORT = process.env.PORT || 3002;
@@ -95,7 +95,11 @@ app.post('/authenticate', async (req, res) => {
   
   try {
     const user = await admin.auth().getUserByEmail(email);
-    const ip = req.ip || req.connection.remoteAddress;
+    
+    // Improved IP detection (works behind proxies)
+    const ip = req.headers['x-forwarded-for']?.split(',')[0] 
+               || req.connection?.remoteAddress 
+               || req.ip;
     
     // Store IP in Firestore
     await db.collection('users_ips').doc(user.uid).set({
