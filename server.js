@@ -6,7 +6,7 @@ const fs = require('fs');
 const ipsRoutes = require('./routes/ipsRoutes');
 const idsRoutes = require('./routes/idsRoutes');
 require('dotenv').config(); 
-app.set('trust proxy', true); // Enable if behind proxy (like Render)
+
 // Configuration 
 const API_KEY = process.env.API_KEY;
 const PORT = process.env.PORT || 3002;
@@ -69,6 +69,8 @@ const manualIPService = {
 
 // Initialize Express
 const app = express();
+// Add this line to trust proxy headers (like X-Forwarded-For)
+app.set('trust proxy', true);  // <-- Add this line here
 app.use(bodyParser.json());
 
 // Helper function for token exchange
