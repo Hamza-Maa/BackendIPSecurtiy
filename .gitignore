@@ -1,0 +1,32 @@
+# Node.js
+node_modules/
+package-lock.json
+
+# Environment variables
+.env
+
+# Logs
+logs/
+*.log
+
+# Sensitive files
+serviceAccountKey.json
+token.txt
+communication-995d1-firebase-adminsdk-fbsvc-a1af605b8f.json
+firebase-service-account.json
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Snort3 (if these are generated files)
+snort3/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
