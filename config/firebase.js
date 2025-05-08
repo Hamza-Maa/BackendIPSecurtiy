@@ -1,13 +1,12 @@
 const admin = require('firebase-admin');
-
-// Path where Render will place the secret file
-const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || '../firebase-service-account.json';
+const path = require('path');
 
 try {
-  const serviceAccount = require(serviceAccountPath);
-  
+  // Initialize using the secret file path from Render
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+    credential: admin.credential.cert(
+      require(process.env.GOOGLE_APPLICATION_CREDENTIALS)
+    )
   });
   console.log('✅ Firebase Admin initialized successfully');
 } catch (error) {
@@ -15,13 +14,7 @@ try {
   process.exit(1);
 }
 
-// Get Firestore instance
 const db = admin.firestore();
-
-// Optional: Firestore settings
 db.settings({ ignoreUndefinedProperties: true });
 
-module.exports = {
-  admin,
-  db
-};
+module.exports = { admin, db };
