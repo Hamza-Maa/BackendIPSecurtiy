@@ -1,0 +1,5 @@
+# Blacklist rules for IPS
+# Format: drop ip [SOURCE_IP] any -> any any (msg:"[REASON]";)
+drop ip 2 any -> any any (msg:"Blocked by IPS: Suspicious activity";)
+drop ip ::25 any -> any any (msg:"Blocked by IPS: Policy violation";)
+drop ip ::50 any -> any any (msg:"Blocked by IPS: Policy violation";)

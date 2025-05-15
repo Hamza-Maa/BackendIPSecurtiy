@@ -19,8 +19,6 @@ firebase-service-account.json
 .vscode/
 .idea/
 
-# Snort3 (if these are generated files)
-snort3/
 
 # OS generated files
 .DS_Store

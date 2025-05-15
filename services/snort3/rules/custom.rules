@@ -1,0 +1,2 @@
+alert tcp any any -> $HOME_NET any (msg:"Suspicious TCP"; sid:1000001;)
+alert tcp any any -> $HOME_NET any (msg:"Suspicious TCP"; sid:1000001;)
