@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3002;
 
 // In-memory storage for manual IP management
 const ipStore = {
-  users: {},       // { uid: { ip, lastActive, blocked } }
+  users: {},       // { uid: { ip, lastActive, userAgent, blocked, blockReason, blockUntil } }
   rateLimits: {},  // { ip: { count, lastRequest } }
   blockedIPs: {},  // { ip: blockUntil }
   blockedUsers: {} // { uid: blockUntil }
@@ -69,6 +69,8 @@ const manualIPService = {
         delete ipStore.blockedUsers[uid];
         if (ipStore.users[uid]) {
           ipStore.users[uid].blocked = false;
+          ipStore.users[uid].blockReason = null;
+          ipStore.users[uid].blockUntil = null;
         }
         cleaned++;
       }
@@ -77,11 +79,31 @@ const manualIPService = {
     return cleaned;
   },
 
-  isUserBlocked: (uid) => {
+  isUserBlocked: async (uid) => {
+    // Check both in-memory and Firestore for consistency
+    const userDoc = await db.collection('users_ips').doc(uid).get();
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+      if (userData.blocked && userData.blockUntil && new Date(userData.blockUntil.toDate()) > new Date()) {
+        ipStore.blockedUsers[uid] = userData.blockUntil.toDate().getTime();
+        return true;
+      }
+    }
     return ipStore.blockedUsers[uid] && ipStore.blockedUsers[uid] > Date.now();
   },
 
-  isIPBlocked: (ip) => {
+  isIPBlocked: async (ip) => {
+    // Check both in-memory and Firestore for consistency
+    const snapshot = await db.collection('ips_blocklist')
+      .where('ip', '==', ip)
+      .where('active', '==', true)
+      .where('expiresAt', '>', new Date())
+      .limit(1)
+      .get();
+    if (!snapshot.empty) {
+      ipStore.blockedIPs[ip] = snapshot.docs[0].data().expiresAt.toDate().getTime();
+      return true;
+    }
     return ipStore.blockedIPs[ip] && ipStore.blockedIPs[ip] > Date.now();
   }
 };
@@ -113,6 +135,12 @@ async function exchangeCustomTokenForIdToken(customToken) {
 app.post('/authenticate', async (req, res) => {
   const { email, password } = req.body;
   
+  // Validate request body
+  if (!email || !password) {
+    console.error("Missing email or password in request body");
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+
   try {
     const user = await admin.auth().getUserByEmail(email);
     
@@ -125,30 +153,25 @@ app.post('/authenticate', async (req, res) => {
     const userDoc = await db.collection('users_ips').doc(user.uid).get();
     const userData = userDoc.exists ? userDoc.data() : {};
     
-    // Handle old users - initialize blocked status if missing
-    const isBlocked = userData.blocked || false;
+    // Handle blocked status
+    const isBlocked = await manualIPService.isUserBlocked(user.uid);
     const blockReason = userData.blockReason || null;
-    const blockUntil = userData.blockUntil || null;
+    const blockUntil = userData.blockUntil ? userData.blockUntil.toDate().getTime() : null;
     
-    // Check if user is blocked (with backward compatibility)
-    if (isBlocked && blockUntil && new Date(blockUntil) > new Date()) {
+    // Check if user is blocked
+    if (isBlocked) {
+      console.log(`User ${user.uid} is blocked until ${blockUntil}`);
       return res.status(403).json({ 
         error: "Account blocked", 
         blocked: true,
         blockReason,
         blockUntil
       });
-    } else if (isBlocked) {
-      // Auto-unblock if block has expired
-      await db.collection('users_ips').doc(user.uid).update({
-        blocked: false,
-        blockReason: null,
-        blockUntil: null
-      });
     }
 
     // Check if IP is blocked
-    if (manualIPService.isIPBlocked(ip)) {
+    if (await manualIPService.isIPBlocked(ip)) {
+      console.log(`IP ${ip} is blocked until ${ipStore.blockedIPs[ip]}`);
       return res.status(403).json({ 
         error: "IP blocked", 
         blocked: true,
@@ -156,34 +179,34 @@ app.post('/authenticate', async (req, res) => {
       });
     }
 
-    // Update user document (with new fields if missing)
-    await db.collection('users_ips').doc(user.uid).set({
+    // Update user document
+    const updatedUserData = {
       ip,
       lastActive: admin.firestore.FieldValue.serverTimestamp(),
-      userAgent: req.headers['user-agent'],
+      userAgent: req.headers['user-agent'] || 'unknown',
       email: user.email,
       uid: user.uid,
       blocked: isBlocked,
       blockReason,
-      blockUntil,
-      // Initialize new fields if they don't exist
-      ...(!userDoc.exists && {
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      })
-    }, { merge: true });
+      blockUntil: blockUntil ? new Date(blockUntil) : null,
+      createdAt: userData.createdAt || admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    await db.collection('users_ips').doc(user.uid).set(updatedUserData, { merge: true });
     
-    // Keep in memory
+    // Update in-memory store
     ipStore.users[user.uid] = { 
-      ip, 
+      ...updatedUserData,
       lastActive: new Date(),
-      userAgent: req.headers['user-agent'],
-      blocked: isBlocked
+      userAgent: req.headers['user-agent'] || 'unknown',
+      blockUntil: blockUntil
     };
     
     // Create and exchange tokens
     const customToken = await admin.auth().createCustomToken(user.uid);
     const idToken = await exchangeCustomTokenForIdToken(customToken);
+    
+    console.log(`Authentication successful for user ${user.uid}, blocked: ${isBlocked}`);
     
     res.json({ 
       token: idToken,
@@ -195,7 +218,7 @@ app.post('/authenticate', async (req, res) => {
     });
     
   } catch (error) {
-    console.error("Authentication error:", error);
+    console.error("Authentication error for email:", email, error);
     res.status(401).json({ error: "Authentication failed" });
   }
 });
@@ -212,11 +235,14 @@ const manualAuth = async (req, res, next) => {
     const decoded = await admin.auth().verifyIdToken(token);
     
     // Check if user is blocked
-    if (manualIPService.isUserBlocked(decoded.uid)) {
+    if (await manualIPService.isUserBlocked(decoded.uid)) {
+      const userDoc = await db.collection('users_ips').doc(decoded.uid).get();
+      const userData = userDoc.data();
       return res.status(403).json({ 
         error: "Account blocked", 
         blocked: true,
-        blockUntil: ipStore.blockedUsers[decoded.uid]
+        blockReason: userData.blockReason || null,
+        blockUntil: userData.blockUntil ? userData.blockUntil.toDate().getTime() : null
       });
     }
 

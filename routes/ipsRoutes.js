@@ -3,53 +3,78 @@ const { db } = require("../config/firebase");
 const ipsService = require("../services/ipsService");
 const router = express.Router();
 
+// Access ipStore from server.js for synchronization
+const { ipStore } = require("../server");
+
+
 // Block an IP address
 router.post("/block", async (req, res) => {
     const { ip, reason, duration } = req.body;
     
     if (!ip || !reason) {
-        return res.status(400).send("IP and reason are required");
+        console.error("Missing ip or reason in /block request");
+        return res.status(400).json({ error: "IP and reason are required" });
     }
 
     try {
-        await ipsService.blockIP(ip, reason, duration);
-        res.status(200).json({
-            message: `✅ IP ${ip} blocked`,
-            reason,
-            duration: duration || 'default'
-        });
+        const success = await ipsService.blockIP(ip, reason, duration);
+        if (success) {
+            // Update in-memory store
+            ipStore.blockedIPs[ip] = Date.now() + (duration || ipsService.blockDuration);
+            console.log(`Successfully blocked IP ${ip}`);
+            res.status(200).json({
+                message: `✅ IP ${ip} blocked`,
+                reason,
+                duration: duration || ipsService.blockDuration
+            });
+        } else {
+            res.status(400).json({ error: `IP ${ip} is already blocked or invalid` });
+        }
     } catch (error) {
-        console.error("Failed to block IP:", error);
-        res.status(500).send("❌ Error blocking IP");
+        console.error("Failed to block IP:", ip, error);
+        res.status(500).json({ error: "Error blocking IP", details: error.message });
     }
 });
 
-// Block by user ID (using their stored IP)
+// Block by user ID
 router.post("/block-user", async (req, res) => {
     const { uid, reason, duration } = req.body;
     
     if (!uid || !reason) {
-        return res.status(400).send("User ID and reason are required");
+        console.error("Missing uid or reason in /block-user request");
+        return res.status(400).json({ error: "User ID and reason are required" });
     }
 
     try {
-        // Get user's IP from users_ips collection
-        const userDoc = await db.collection('users_ips').doc(uid).get();
-        if (!userDoc.exists) {
-            return res.status(404).send("User IP not found");
+        const success = await ipsService.blockUser(uid, reason, duration);
+        if (success) {
+            // Update in-memory store
+            ipStore.blockedUsers[uid] = Date.now() + (duration || ipsService.blockDuration);
+            const userDoc = await db.collection('users_ips').doc(uid).get();
+            if (userDoc.exists) {
+                const userData = userDoc.data();
+                ipStore.users[uid] = {
+                    ...ipStore.users[uid],
+                    ip: userData.ip,
+                    lastActive: userData.lastActive?.toDate() || new Date(),
+                    userAgent: userData.userAgent || 'unknown',
+                    blocked: true,
+                    blockReason: reason,
+                    blockUntil: new Date(Date.now() + (duration || ipsService.blockDuration)).getTime()
+                };
+            }
+            console.log(`Successfully blocked user ${uid}`);
+            res.status(200).json({
+                message: `✅ User ${uid} blocked`,
+                reason,
+                duration: duration || ipsService.blockDuration
+            });
+        } else {
+            res.status(400).json({ error: `User ${uid} is already blocked or not found` });
         }
-        
-        const userIP = userDoc.data().ip;
-        await ipsService.blockIP(userIP, reason, duration);
-        
-        res.status(200).json({
-            message: `✅ User ${uid} (IP: ${userIP}) blocked`,
-            reason,
-            duration: duration || 'default'
-        });
     } catch (error) {
-        console.error("Failed to block user:", error);
-        res.status(500).send("❌ Error blocking user");
+        console.error("Failed to block user:", uid, error);
+        res.status(500).json({ error: "Error blocking user", details: error.message });
     }
 });
 
@@ -58,15 +83,22 @@ router.delete("/unblock", async (req, res) => {
     const { ip } = req.body;
     
     if (!ip) {
-        return res.status(400).send("IP is required");
+        console.error("Missing ip in /unblock request");
+        return res.status(400).json({ error: "IP is required" });
     }
 
     try {
-        await ipsService.unblockIP(ip);
-        res.status(200).send(`✅ IP ${ip} unblocked`);
+        const success = await ipsService.unblockIP(ip);
+        if (success) {
+            delete ipStore.blockedIPs[ip];
+            console.log(`Successfully unblocked IP ${ip}`);
+            res.status(200).json({ message: `✅ IP ${ip} unblocked` });
+        } else {
+            res.status(400).json({ error: `IP ${ip} is not blocked` });
+        }
     } catch (error) {
-        console.error("Failed to unblock IP:", error);
-        res.status(500).send("❌ Error unblocking IP");
+        console.error("Failed to unblock IP:", ip, error);
+        res.status(500).json({ error: "Error unblocking IP", details: error.message });
     }
 });
 
@@ -77,7 +109,7 @@ router.get("/blocked", async (req, res) => {
         res.status(200).json(blockedIPs);
     } catch (error) {
         console.error("Failed to get blocked IPs:", error);
-        res.status(500).send("❌ Error getting blocked IPs");
+        res.status(500).json({ error: "Error getting blocked IPs", details: error.message });
     }
 });
 
@@ -93,7 +125,7 @@ router.get("/suspicious", async (req, res) => {
         res.status(200).json(activity);
     } catch (error) {
         console.error("Failed to get suspicious activity:", error);
-        res.status(500).send("❌ Error getting suspicious activity");
+        res.status(500).json({ error: "Error getting suspicious activity", details: error.message });
     }
 });
 
@@ -101,13 +133,14 @@ router.get("/suspicious", async (req, res) => {
 router.post("/cleanup", async (req, res) => {
     try {
         const cleanedCount = await ipsService.cleanupExpiredBlocks();
+        console.log(`Cleaned ${cleanedCount} expired blocks`);
         res.status(200).json({
             message: "✅ Cleanup completed",
             cleanedCount
         });
     } catch (error) {
         console.error("Failed to cleanup expired blocks:", error);
-        res.status(500).send("❌ Error cleaning up expired blocks");
+        res.status(500).json({ error: "Error cleaning up expired blocks", details: error.message });
     }
 });
 
@@ -138,7 +171,7 @@ router.get("/stats", async (req, res) => {
         res.status(200).json(stats);
     } catch (error) {
         console.error("Failed to get IPS statistics:", error);
-        res.status(500).send("❌ Error getting IPS statistics");
+        res.status(500).json({ error: "Error getting IPS statistics", details: error.message });
     }
 });
 
