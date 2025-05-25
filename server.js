@@ -120,10 +120,19 @@ app.post('/authenticate', async (req, res) => {
     
     // Check IP block
     if (await ipsService.isIPBlocked(ip)) {
+      const ipBlock = await db.collection('ips_blocklist')
+        .where('ip', '==', ip)
+        .where('active', '==', true)
+        .limit(1)
+        .get();
+      
+      const blockData = ipBlock.docs[0]?.data();
+      
       return res.status(403).json({ 
         error: "IP blocked", 
         blocked: true,
-        blockReason: "IP blocked by administrator"
+        blockReason: blockData?.reason || "IP blocked",
+        blockUntil: blockData?.expiresAt?.toDate() || null
       });
     }
 

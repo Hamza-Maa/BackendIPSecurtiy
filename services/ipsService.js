@@ -6,22 +6,9 @@ const geoip = require('geoip-lite');
 
 class IPSService {
     constructor() {
-        this.blacklistPath = path.join(__dirname, '../../snort3/rules/blacklist.rules');
         this.rateLimit = new Map();
         this.suspiciousIPs = new Map();
         this.blockDuration = 3600000; // 1 hour in milliseconds
-        
-        this.initializeBlacklistFile().catch(err => {
-            console.error('❌ Failed to initialize blacklist file:', err);
-        });
-    }
-
-    async initializeBlacklistFile() {
-        try {
-            await fs.access(this.blacklistPath);
-        } catch (error) {
-            await fs.writeFile(this.blacklistPath, '# IPS Blacklist Rules\n', 'utf-8');
-        }
     }
 
     async isIPBlocked(ip) {
@@ -77,12 +64,6 @@ class IPSService {
 
             const geo = geoip.lookup(ip);
             const expiresAt = new Date(Date.now() + duration);
-            const blockRule = `drop ip ${ip} any -> any any (msg:"Blocked by IPS: ${reason}";)\n`;
-            
-            let currentRules = await fs.readFile(this.blacklistPath, 'utf-8');
-            if (!currentRules.includes(blockRule)) {
-                await fs.appendFile(this.blacklistPath, blockRule);
-            }
 
             await db.collection('ips_blocklist').add({
                 ip,
@@ -132,13 +113,6 @@ class IPSService {
 
     async unblockIP(ip) {
         try {
-            let blacklist = await fs.readFile(this.blacklistPath, 'utf-8');
-            const updatedRules = blacklist.replace(new RegExp(`drop ip ${ip} .*?\\n`, 'g'), '');
-            
-            if (updatedRules !== blacklist) {
-                await fs.writeFile(this.blacklistPath, updatedRules);
-            }
-
             const snapshot = await db.collection('ips_blocklist')
                 .where('ip', '==', ip)
                 .where('active', '==', true)
