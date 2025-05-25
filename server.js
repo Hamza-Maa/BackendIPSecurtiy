@@ -1,3 +1,4 @@
+const ipStore = require('./config/ipStore');
 const express = require("express");
 const bodyParser = require("body-parser");
 const schedule = require('node-schedule');
@@ -8,17 +9,10 @@ const idsRoutes = require('./routes/idsRoutes');
 const ipsService = require('./services/ipsService'); // Add this import
 require('dotenv').config(); 
 
+
 // Configuration 
 const API_KEY = process.env.API_KEY;
 const PORT = process.env.PORT || 3002;
-
-// In-memory storage for manual IP management
-const ipStore = {
-  users: {},       // { uid: { ip, lastActive, blocked } }
-  rateLimits: {},  // { ip: { count, lastRequest } }
-  blockedIPs: {},  // { ip: blockUntil }
-  blockedUsers: {} // { uid: blockUntil }
-};
 
 // Manual IP Analysis Service
 const manualIPService = {

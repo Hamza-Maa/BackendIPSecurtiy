@@ -6,9 +6,9 @@ const schedule = require('node-schedule');
 
 class IDSService {
     constructor() {
-        this.alertsPath = path.join(__dirname, './logs/alerts.json');
-        this.rulesPath = path.join(__dirname, 'snort3/rules/local.rules');
-        this.customRulesPath = path.join(__dirname, 'snort3/rules/custom.rules');
+        this.alertsPath = path.join(__dirname, '../logs/alerts.json');
+        this.rulesPath = path.join(__dirname, './snort3/rules/local.rules');
+        this.customRulesPath = path.join(__dirname, './snort3/rules/custom.rules');
         this.emailTransporter = null;
         this.alerts = [];
         

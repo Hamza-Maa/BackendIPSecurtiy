@@ -1,3 +1,4 @@
+const ipStore = require('../config/ipStore');
 const express = require("express");
 const { db } = require("../config/firebase");
 const ipsService = require("../services/ipsService");
