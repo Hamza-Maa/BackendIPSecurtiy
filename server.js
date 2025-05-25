@@ -116,21 +116,37 @@ app.post('/authenticate', async (req, res) => {
   try {
     const user = await admin.auth().getUserByEmail(email);
     
-    // Check if user is blocked
-    const isBlocked = manualIPService.isUserBlocked(user.uid);
-    if (isBlocked) {
-      return res.status(403).json({ 
-        error: "Account blocked", 
-        blocked: true,
-        blockUntil: ipStore.blockedUsers[user.uid]
-      });
-    }
-
     // Improved IP detection (works behind proxies)
     const ip = req.headers['x-forwarded-for']?.split(',')[0] 
                || req.connection?.remoteAddress 
                || req.ip;
     
+    // Get user document from Firestore
+    const userDoc = await db.collection('users_ips').doc(user.uid).get();
+    const userData = userDoc.exists ? userDoc.data() : {};
+    
+    // Handle old users - initialize blocked status if missing
+    const isBlocked = userData.blocked || false;
+    const blockReason = userData.blockReason || null;
+    const blockUntil = userData.blockUntil || null;
+    
+    // Check if user is blocked (with backward compatibility)
+    if (isBlocked && blockUntil && new Date(blockUntil) > new Date()) {
+      return res.status(403).json({ 
+        error: "Account blocked", 
+        blocked: true,
+        blockReason,
+        blockUntil
+      });
+    } else if (isBlocked) {
+      // Auto-unblock if block has expired
+      await db.collection('users_ips').doc(user.uid).update({
+        blocked: false,
+        blockReason: null,
+        blockUntil: null
+      });
+    }
+
     // Check if IP is blocked
     if (manualIPService.isIPBlocked(ip)) {
       return res.status(403).json({ 
@@ -140,14 +156,21 @@ app.post('/authenticate', async (req, res) => {
       });
     }
 
-    // Store IP in Firestore
+    // Update user document (with new fields if missing)
     await db.collection('users_ips').doc(user.uid).set({
       ip,
       lastActive: admin.firestore.FieldValue.serverTimestamp(),
       userAgent: req.headers['user-agent'],
       email: user.email,
       uid: user.uid,
-      blocked: isBlocked
+      blocked: isBlocked,
+      blockReason,
+      blockUntil,
+      // Initialize new fields if they don't exist
+      ...(!userDoc.exists && {
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      })
     }, { merge: true });
     
     // Keep in memory
@@ -166,7 +189,9 @@ app.post('/authenticate', async (req, res) => {
       token: idToken,
       ip,
       uid: user.uid,
-      blocked: isBlocked
+      blocked: isBlocked,
+      blockReason,
+      blockUntil
     });
     
   } catch (error) {
