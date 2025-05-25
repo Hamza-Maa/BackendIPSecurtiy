@@ -5,6 +5,7 @@ const { admin, db } = require('./config/firebase');
 const fs = require('fs');
 const ipsRoutes = require('./routes/ipsRoutes');
 const idsRoutes = require('./routes/idsRoutes');
+const ipsService = require('./services/ipsService'); // Add this import
 require('dotenv').config(); 
 
 // Configuration 
