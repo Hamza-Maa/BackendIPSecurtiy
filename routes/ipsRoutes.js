@@ -12,11 +12,17 @@ router.post("/block", async (req, res) => {
     }
 
     try {
+        // Block in both systems
         await ipsService.blockIP(ip, reason, duration);
+        
+        // Also add to in-memory store
+        const blockDuration = duration || ipsService.blockDuration;
+        ipStore.blockedIPs[ip] = Date.now() + blockDuration;
+        
         res.status(200).json({
             message: `✅ IP ${ip} blocked`,
             reason,
-            duration: duration || 'default'
+            duration: blockDuration
         });
     } catch (error) {
         console.error("Failed to block IP:", error);

@@ -201,18 +201,33 @@ const manualAuth = async (req, res, next) => {
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     
-    // Check if user is blocked
-    if (manualIPService.isUserBlocked(decoded.uid)) {
+    // Check if user is blocked in either system
+    const isUserBlocked = manualIPService.isUserBlocked(decoded.uid) || 
+                         await ipsService.isUserBlocked(decoded.uid);
+    
+    if (isUserBlocked) {
+      // Get block details from both systems
+      const inMemoryBlock = ipStore.blockedUsers[decoded.uid];
+      const firestoreBlock = await db.collection('users_ips').doc(decoded.uid).get()
+        .then(doc => doc.exists && doc.data().blockUntil ? doc.data().blockUntil.toDate().getTime() : null);
+      
       return res.status(403).json({ 
         error: "Account blocked", 
         blocked: true,
-        blockUntil: ipStore.blockedUsers[decoded.uid]
+        blockUntil: inMemoryBlock || firestoreBlock,
+        blockSource: inMemoryBlock ? 'memory' : 'firestore'
       });
     }
 
+    // Get user data from both systems
+    const [memoryData, firestoreData] = await Promise.all([
+      ipStore.users[decoded.uid],
+      db.collection('users_ips').doc(decoded.uid).get().then(doc => doc.data())
+    ]);
+
     req.user = { 
       ...decoded, 
-      ipData: ipStore.users[decoded.uid] || await db.collection('users_ips').doc(decoded.uid).get().then(doc => doc.data()),
+      ipData: memoryData || firestoreData,
       blocked: false
     };
     next();
@@ -223,32 +238,65 @@ const manualAuth = async (req, res, next) => {
 };
 
 // Apply security to all /api routes
-app.use('/api', manualAuth, (req, res, next) => {
+app.use('/api', manualAuth, async (req, res, next) => {
   const ip = req.ip;
   
-  // Check if IP is blocked
-  if (manualIPService.isIPBlocked(ip)) {
+  // Check if IP is blocked in either system
+  const isIPBlocked = manualIPService.isIPBlocked(ip) || 
+                      await ipsService.isIPBlocked(ip);
+  
+  if (isIPBlocked) {
+    // Get block details from both systems
+    const inMemoryBlock = ipStore.blockedIPs[ip];
+    const firestoreBlock = await db.collection('ips_blocklist')
+      .where('ip', '==', ip)
+      .where('active', '==', true)
+      .limit(1)
+      .get()
+      .then(snapshot => {
+        if (snapshot.empty) return null;
+        return snapshot.docs[0].data().expiresAt.toDate().getTime();
+      });
+
     return res.status(403).json({ 
       error: "IP blocked", 
       blocked: true,
-      blockUntil: ipStore.blockedIPs[ip]
+      blockUntil: inMemoryBlock || firestoreBlock,
+      blockSource: inMemoryBlock ? 'memory' : 'firestore'
     });
   }
 
   // Check rate limit
   if (!manualIPService.checkRateLimit(ip)) {
-    return res.status(429).send('Too many requests');
+    // Auto-block IP that exceeds rate limit
+    await ipsService.blockIP(ip, 'Rate limit exceeded');
+    ipStore.blockedIPs[ip] = Date.now() + 3600000; // 1 hour
+    
+    return res.status(429).json({
+      error: 'Too many requests',
+      blocked: true,
+      blockUntil: Date.now() + 3600000
+    });
   }
   
   // Analyze traffic
-  if (!manualIPService.analyzeTraffic(ip, {
+  const isTrafficValid = manualIPService.analyzeTraffic(ip, {
     method: req.method,
     path: req.path,
     headers: req.headers,
     body: req.body
-  })) {
-    ipStore.blockedIPs[ip] = Date.now() + 3600000;
-    return res.status(403).send('Suspicious activity detected');
+  });
+  
+  if (!isTrafficValid) {
+    // Block in both systems when suspicious activity detected
+    await ipsService.blockIP(ip, 'Suspicious activity detected');
+    ipStore.blockedIPs[ip] = Date.now() + 3600000; // 1 hour
+    
+    return res.status(403).json({
+      error: 'Suspicious activity detected',
+      blocked: true,
+      blockUntil: Date.now() + 3600000
+    });
   }
   
   next();
