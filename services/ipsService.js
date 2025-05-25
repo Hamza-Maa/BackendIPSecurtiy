@@ -40,7 +40,29 @@ class IPSService {
             return !snapshot.empty;
         } catch (error) {
             console.error(`❌ Error checking if IP ${ip} is blocked:`, error);
-            // Return false to allow the operation to continue
+            return false;
+        }
+    }
+
+    async isUserBlocked(uid) {
+        try {
+            const userDoc = await db.collection('users_ips').doc(uid).get();
+            if (!userDoc.exists) return false;
+            
+            const userData = userDoc.data();
+            if (userData.blocked && userData.blockUntil) {
+                const blockUntil = userData.blockUntil.toDate();
+                if (blockUntil > new Date()) {
+                    return true;
+                } else {
+                    // Auto-unblock if block has expired
+                    await this.unblockUser(uid);
+                    return false;
+                }
+            }
+            return false;
+        } catch (error) {
+            console.error(`❌ Error checking if user ${uid} is blocked:`, error);
             return false;
         }
     }
@@ -72,7 +94,7 @@ class IPSService {
             await db.collection('ips_blocklist').add({
                 ip,
                 reason,
-                timestamp: new Date(),
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
                 expiresAt: new Date(Date.now() + duration),
                 geo: geo || null,
                 active: true
@@ -90,11 +112,36 @@ class IPSService {
         }
     }
 
-    /**
-     * Unblock an IP address
-     * @param {string} ip - IP address to unblock
-     * @returns {Promise<boolean>} - True if unblocked successfully
-     */
+    async blockUser(uid, reason, duration = this.blockDuration) {
+        try {
+            const isBlocked = await this.isUserBlocked(uid);
+            if (isBlocked) {
+                console.log(`ℹ️ User ${uid} is already blocked`);
+                return false;
+            }
+
+            // Update user document
+            await db.collection('users_ips').doc(uid).update({
+                blocked: true,
+                blockReason: reason,
+                blockUntil: new Date(Date.now() + duration),
+                blockedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // Also block the user's current IP if available
+            const userDoc = await db.collection('users_ips').doc(uid).get();
+            if (userDoc.exists && userDoc.data().ip) {
+                await this.blockIP(userDoc.data().ip, `User ${uid} blocked: ${reason}`, duration);
+            }
+
+            console.log(`✅ Successfully blocked user: ${uid}`);
+            return true;
+        } catch (error) {
+            console.error(`❌ Failed to block user ${uid}:`, error);
+            throw new Error(`User blocking failed: ${error.message}`);
+        }
+    }
+
     async unblockIP(ip) {
         try {
             // Update Snort rules
@@ -131,13 +178,78 @@ class IPSService {
         }
     }
 
-    /**
-     * Check rate limiting for an IP
-     * @param {string} ip - IP address to check
-     * @param {number} [threshold=100] - Max requests allowed
-     * @param {number} [timeWindow=60000] - Time window in ms (default 1 minute)
-     * @returns {Promise<boolean>} - True if within rate limit
-     */
+    async unblockUser(uid) {
+        try {
+            const userDoc = await db.collection('users_ips').doc(uid).get();
+            if (!userDoc.exists) {
+                return false;
+            }
+
+            await db.collection('users_ips').doc(uid).update({
+                blocked: false,
+                blockReason: null,
+                blockUntil: null,
+                unblocked: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // Also unblock the user's IP if it was only blocked because of the user
+            const userData = userDoc.data();
+            if (userData.ip) {
+                const ipBlocks = await db.collection('ips_blocklist')
+                    .where('ip', '==', userData.ip)
+                    .where('reason', '==', `User ${uid} blocked`)
+                    .where('active', '==', true)
+                    .get();
+
+                if (!ipBlocks.empty) {
+                    await this.unblockIP(userData.ip);
+                }
+            }
+
+            console.log(`✅ Successfully unblocked user: ${uid}`);
+            return true;
+        } catch (error) {
+            console.error(`❌ Error unblocking user ${uid}:`, error);
+            throw new Error(`Failed to unblock user: ${error.message}`);
+        }
+    }
+
+    async getBlockedIPs() {
+        try {
+            const snapshot = await db.collection('ips_blocklist')
+                .where('active', '==', true)
+                .get();
+
+            return snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                expiresAt: doc.data().expiresAt.toDate()
+            }));
+        } catch (error) {
+            console.error('❌ Error getting blocked IPs:', error);
+            throw new Error('Failed to retrieve blocked IPs');
+        }
+    }
+
+    async getBlockedUsers() {
+        try {
+            const snapshot = await db.collection('users_ips')
+                .where('blocked', '==', true)
+                .get();
+
+            return snapshot.docs.map(doc => ({
+                id: doc.id,
+                uid: doc.id,
+                ...doc.data(),
+                blockUntil: doc.data().blockUntil?.toDate(),
+                blockedAt: doc.data().blockedAt?.toDate()
+            }));
+        } catch (error) {
+            console.error('❌ Error getting blocked users:', error);
+            throw new Error('Failed to retrieve blocked users');
+        }
+    }
+
     async checkRateLimit(ip, threshold = 100, timeWindow = 60000) {
         const now = Date.now();
         const ipData = this.rateLimit.get(ip) || { count: 0, firstRequest: now };
@@ -160,12 +272,6 @@ class IPSService {
         return true;
     }
 
-    /**
-     * Analyze traffic for suspicious activity
-     * @param {string} ip - Source IP address
-     * @param {object} requestData - Request data to analyze
-     * @returns {Promise<boolean>} - True if traffic is clean
-     */
     async analyzeTraffic(ip, requestData) {
         try {
             if (await this.isIPBlocked(ip)) {
@@ -198,11 +304,6 @@ class IPSService {
         }
     }
 
-    /**
-     * Detect suspicious patterns in request data
-     * @param {object} requestData - Request data to check
-     * @returns {boolean} - True if suspicious
-     */
     detectSuspiciousActivity(requestData) {
         const suspiciousPatterns = [
             /'.*OR.*['";]/i,          // SQL Injection
@@ -219,34 +320,6 @@ class IPSService {
         return suspiciousPatterns.some(pattern => pattern.test(requestString));
     }
 
-    /**
-     * Get list of currently blocked IPs
-     * @returns {Promise<Array>} - Array of blocked IPs
-     */
-    async getBlockedIPs() {
-        try {
-            const snapshot = await db.collection('ips_blocklist')
-                .where('active', '==', true)
-                .get();
-
-            return snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data(),
-                expiresAt: doc.data().expiresAt.toDate()
-            }));
-        } catch (error) {
-            console.error('❌ Error getting blocked IPs:', error);
-            throw new Error('Failed to retrieve blocked IPs');
-        }
-    }
-
-    /**
-     * Get suspicious activity logs
-     * @param {object} [options] - Filter options
-     * @param {number} [options.limit=100] - Max records to return
-     * @param {string} [options.ip] - Filter by IP address
-     * @returns {Promise<Array>} - Array of suspicious activities
-     */
     async getSuspiciousActivity(options = {}) {
         try {
             let query = db.collection('ips_suspicious_activity')
@@ -272,55 +345,65 @@ class IPSService {
         }
     }
 
-    /**
-     * Clean up expired blocks
-     * @returns {Promise<number>} - Number of blocks cleaned
-     */
     async cleanupExpiredBlocks() {
         try {
-            const now = new Date(); // Use JavaScript Date instead of Firestore Timestamp
-            
-            // Get all active blocks where expiresAt is in the past
-            const snapshot = await db.collection('ips_blocklist')
-                .where('active', '==', true)
-                .get();
-            
+            const now = new Date();
             let cleanedCount = 0;
-            const batch = db.batch();
 
-            snapshot.forEach(doc => {
-                const data = doc.data();
-                // Convert Firestore Timestamp to Date if needed
-                const expiresAt = data.expiresAt.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
-                
-                if (expiresAt <= now) {
-                    batch.update(doc.ref, { 
-                        active: false,
-                        unblocked: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                    cleanedCount++;
-                }
+            // Clean expired IP blocks
+            const ipSnapshot = await db.collection('ips_blocklist')
+                .where('active', '==', true)
+                .where('expiresAt', '<=', now)
+                .get();
+
+            const ipBatch = db.batch();
+            ipSnapshot.forEach(doc => {
+                ipBatch.update(doc.ref, { 
+                    active: false,
+                    unblocked: admin.firestore.FieldValue.serverTimestamp()
+                });
+                cleanedCount++;
             });
 
-            if (cleanedCount > 0) {
-                await batch.commit();
+            if (!ipSnapshot.empty) {
+                await ipBatch.commit();
                 
-                // Also update Snort rules for the unblocked IPs
-                const currentRules = await fs.readFile(this.blacklistPath, 'utf-8');
-                const updatedRules = snapshot.docs
-                    .filter(doc => {
-                        const data = doc.data();
-                        const expiresAt = data.expiresAt.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
-                        return expiresAt <= now;
-                    })
-                    .reduce((rules, doc) => {
-                        const ip = doc.data().ip;
-                        return rules.replace(new RegExp(`drop ip ${ip} .*?\\n`, 'g'), '');
-                    }, currentRules);
+                // Update Snort rules
+                let currentRules = await fs.readFile(this.blacklistPath, 'utf-8');
+                let updatedRules = currentRules;
                 
-                await fs.writeFile(this.blacklistPath, updatedRules);
+                ipSnapshot.forEach(doc => {
+                    const ip = doc.data().ip;
+                    updatedRules = updatedRules.replace(new RegExp(`drop ip ${ip} .*?\\n`, 'g'), '');
+                });
+
+                if (updatedRules !== currentRules) {
+                    await fs.writeFile(this.blacklistPath, updatedRules);
+                }
             }
 
+            // Clean expired user blocks
+            const userSnapshot = await db.collection('users_ips')
+                .where('blocked', '==', true)
+                .where('blockUntil', '<=', now)
+                .get();
+
+            const userBatch = db.batch();
+            userSnapshot.forEach(doc => {
+                userBatch.update(doc.ref, { 
+                    blocked: false,
+                    blockReason: null,
+                    blockUntil: null,
+                    unblocked: admin.firestore.FieldValue.serverTimestamp()
+                });
+                cleanedCount++;
+            });
+
+            if (!userSnapshot.empty) {
+                await userBatch.commit();
+            }
+
+            console.log(`🧹 Cleaned ${cleanedCount} expired blocks`);
             return cleanedCount;
         } catch (error) {
             console.error('❌ Error cleaning up expired blocks:', error);

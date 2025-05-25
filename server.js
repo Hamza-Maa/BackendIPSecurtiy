@@ -13,9 +13,10 @@ const PORT = process.env.PORT || 3002;
 
 // In-memory storage for manual IP management
 const ipStore = {
-  users: {},       // { uid: { ip, lastActive } }
+  users: {},       // { uid: { ip, lastActive, blocked } }
   rateLimits: {},  // { ip: { count, lastRequest } }
-  blockedIPs: {}   // { ip: blockUntil }
+  blockedIPs: {},  // { ip: blockUntil }
+  blockedUsers: {} // { uid: blockUntil }
 };
 
 // Manual IP Analysis Service
@@ -62,15 +63,32 @@ const manualIPService = {
         cleaned++;
       }
     });
+
+    Object.keys(ipStore.blockedUsers).forEach(uid => {
+      if (ipStore.blockedUsers[uid] < now) {
+        delete ipStore.blockedUsers[uid];
+        if (ipStore.users[uid]) {
+          ipStore.users[uid].blocked = false;
+        }
+        cleaned++;
+      }
+    });
     
     return cleaned;
+  },
+
+  isUserBlocked: (uid) => {
+    return ipStore.blockedUsers[uid] && ipStore.blockedUsers[uid] > Date.now();
+  },
+
+  isIPBlocked: (ip) => {
+    return ipStore.blockedIPs[ip] && ipStore.blockedIPs[ip] > Date.now();
   }
 };
 
 // Initialize Express
 const app = express();
-// Add this line to trust proxy headers (like X-Forwarded-For)
-app.set('trust proxy', true);  // <-- Add this line here
+app.set('trust proxy', true);
 app.use(bodyParser.json());
 
 // Helper function for token exchange
@@ -98,25 +116,46 @@ app.post('/authenticate', async (req, res) => {
   try {
     const user = await admin.auth().getUserByEmail(email);
     
+    // Check if user is blocked
+    const isBlocked = manualIPService.isUserBlocked(user.uid);
+    if (isBlocked) {
+      return res.status(403).json({ 
+        error: "Account blocked", 
+        blocked: true,
+        blockUntil: ipStore.blockedUsers[user.uid]
+      });
+    }
+
     // Improved IP detection (works behind proxies)
     const ip = req.headers['x-forwarded-for']?.split(',')[0] 
                || req.connection?.remoteAddress 
                || req.ip;
     
+    // Check if IP is blocked
+    if (manualIPService.isIPBlocked(ip)) {
+      return res.status(403).json({ 
+        error: "IP blocked", 
+        blocked: true,
+        blockUntil: ipStore.blockedIPs[ip]
+      });
+    }
+
     // Store IP in Firestore
     await db.collection('users_ips').doc(user.uid).set({
       ip,
       lastActive: admin.firestore.FieldValue.serverTimestamp(),
       userAgent: req.headers['user-agent'],
       email: user.email,
-      uid: user.uid
+      uid: user.uid,
+      blocked: isBlocked
     }, { merge: true });
     
     // Keep in memory
     ipStore.users[user.uid] = { 
       ip, 
       lastActive: new Date(),
-      userAgent: req.headers['user-agent']
+      userAgent: req.headers['user-agent'],
+      blocked: isBlocked
     };
     
     // Create and exchange tokens
@@ -126,7 +165,8 @@ app.post('/authenticate', async (req, res) => {
     res.json({ 
       token: idToken,
       ip,
-      uid: user.uid 
+      uid: user.uid,
+      blocked: isBlocked
     });
     
   } catch (error) {
@@ -145,9 +185,20 @@ const manualAuth = async (req, res, next) => {
   
   try {
     const decoded = await admin.auth().verifyIdToken(token);
+    
+    // Check if user is blocked
+    if (manualIPService.isUserBlocked(decoded.uid)) {
+      return res.status(403).json({ 
+        error: "Account blocked", 
+        blocked: true,
+        blockUntil: ipStore.blockedUsers[decoded.uid]
+      });
+    }
+
     req.user = { 
       ...decoded, 
-      ipData: ipStore.users[decoded.uid] || await db.collection('users_ips').doc(decoded.uid).get().then(doc => doc.data())
+      ipData: ipStore.users[decoded.uid] || await db.collection('users_ips').doc(decoded.uid).get().then(doc => doc.data()),
+      blocked: false
     };
     next();
   } catch (error) {
@@ -160,6 +211,15 @@ const manualAuth = async (req, res, next) => {
 app.use('/api', manualAuth, (req, res, next) => {
   const ip = req.ip;
   
+  // Check if IP is blocked
+  if (manualIPService.isIPBlocked(ip)) {
+    return res.status(403).json({ 
+      error: "IP blocked", 
+      blocked: true,
+      blockUntil: ipStore.blockedIPs[ip]
+    });
+  }
+
   // Check rate limit
   if (!manualIPService.checkRateLimit(ip)) {
     return res.status(429).send('Too many requests');
@@ -185,7 +245,8 @@ app.use('/api', manualAuth, (req, res, next) => {
 app.get('/api/ids', (req, res) => {
   res.json({ 
     message: "IDS Data",
-    yourIp: req.user.ipData.ip 
+    yourIp: req.user.ipData.ip,
+    blocked: req.user.ipData.blocked || false
   });
 });
 
@@ -193,6 +254,7 @@ app.get('/api/ips', (req, res) => {
   res.json({
     message: "IPS Data",
     currentUser: req.user.uid,
+    blocked: false,
     storedIPs: ipStore.users
   });
 });
@@ -227,7 +289,7 @@ schedule.scheduleJob('0 * * * *', () => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log('\n=== Authentication ===');
-  console.log(`POST /authenticate - Authenticate user (body: {email, password})`);
+  console.log('POST /authenticate - Authenticate user (body: {email, password})');
   
   console.log('\n=== Core API ===');
   console.log('GET /api/ids - Basic IDS info');
