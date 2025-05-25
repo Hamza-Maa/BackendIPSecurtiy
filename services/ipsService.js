@@ -1,3 +1,4 @@
+// services/ipsService.js
 const { admin, db } = require('../config/firebase');
 const fs = require('fs').promises;
 const path = require('path');
@@ -5,25 +6,14 @@ const geoip = require('geoip-lite');
 
 class IPSService {
     constructor() {
-        this.blacklistPath = path.join(__dirname, 'snort3/rules/blacklist.rules');
+        this.blacklistPath = path.join(__dirname, '../../snort3/rules/blacklist.rules');
         this.rateLimit = new Map();
         this.suspiciousIPs = new Map();
         this.blockDuration = 3600000; // 1 hour in milliseconds
         
-        // In-memory stores
-        this.ipStore = {
-            users: {},
-            rateLimits: {},
-            blockedIPs: {},
-            blockedUsers: {}
-        };
-
         this.initializeBlacklistFile().catch(err => {
             console.error('❌ Failed to initialize blacklist file:', err);
         });
-
-        // Schedule regular cleanups
-        setInterval(() => this.cleanupExpiredBlocks(), 3600000);
     }
 
     async initializeBlacklistFile() {
@@ -36,15 +26,8 @@ class IPSService {
 
     async isIPBlocked(ip) {
         try {
-            // Skip check for localhost
             if (ip === '::1' || ip === '127.0.0.1') return false;
 
-            // Check in-memory store first
-            if (this.ipStore.blockedIPs[ip] && this.ipStore.blockedIPs[ip] > Date.now()) {
-                return true;
-            }
-
-            // Fall back to Firestore check
             const snapshot = await db.collection('ips_blocklist')
                 .where('ip', '==', ip)
                 .where('active', '==', true)
@@ -52,14 +35,7 @@ class IPSService {
                 .limit(1)
                 .get();
             
-            const isBlocked = !snapshot.empty;
-            if (isBlocked && snapshot.docs[0]) {
-                // Sync to in-memory store
-                const data = snapshot.docs[0].data();
-                this.ipStore.blockedIPs[ip] = data.expiresAt.toDate().getTime();
-            }
-            
-            return isBlocked;
+            return !snapshot.empty;
         } catch (error) {
             console.error(`❌ Error checking if IP ${ip} is blocked:`, error);
             return false;
@@ -68,12 +44,6 @@ class IPSService {
 
     async isUserBlocked(uid) {
         try {
-            // Check in-memory store first
-            if (this.ipStore.blockedUsers[uid] && this.ipStore.blockedUsers[uid] > Date.now()) {
-                return true;
-            }
-
-            // Fall back to Firestore check
             const userDoc = await db.collection('users_ips').doc(uid).get();
             if (!userDoc.exists) return false;
             
@@ -81,14 +51,8 @@ class IPSService {
             if (userData.blocked && userData.blockUntil) {
                 const blockUntil = userData.blockUntil.toDate();
                 if (blockUntil > new Date()) {
-                    // Sync to in-memory store
-                    this.ipStore.blockedUsers[uid] = blockUntil.getTime();
-                    if (this.ipStore.users[uid]) {
-                        this.ipStore.users[uid].blocked = true;
-                    }
                     return true;
                 } else {
-                    // Auto-unblock if expired
                     await this.unblockUser(uid);
                 }
             }
@@ -101,13 +65,11 @@ class IPSService {
 
     async blockIP(ip, reason, duration = this.blockDuration) {
         try {
-            // Skip blocking localhost
             if (ip === '::1' || ip === '127.0.0.1') {
                 console.warn(`⚠️ Skipping block for localhost IP: ${ip}`);
                 return false;
             }
 
-            // Check if already blocked
             if (await this.isIPBlocked(ip)) {
                 console.log(`ℹ️ IP ${ip} is already blocked`);
                 return false;
@@ -117,13 +79,11 @@ class IPSService {
             const expiresAt = new Date(Date.now() + duration);
             const blockRule = `drop ip ${ip} any -> any any (msg:"Blocked by IPS: ${reason}";)\n`;
             
-            // Update Snort rules
             let currentRules = await fs.readFile(this.blacklistPath, 'utf-8');
             if (!currentRules.includes(blockRule)) {
                 await fs.appendFile(this.blacklistPath, blockRule);
             }
 
-            // Store in Firestore
             await db.collection('ips_blocklist').add({
                 ip,
                 reason,
@@ -133,24 +93,16 @@ class IPSService {
                 active: true
             });
 
-            // Update in-memory store
-            this.ipStore.blockedIPs[ip] = expiresAt.getTime();
-
-            // Clear tracking data
-            this.rateLimit.delete(ip);
-            this.suspiciousIPs.delete(ip);
-
-            console.log(`✅ Successfully blocked IP: ${ip} until ${expiresAt}`);
+            console.log(`✅ Successfully blocked IP: ${ip}`);
             return true;
         } catch (error) {
             console.error(`❌ Failed to block IP ${ip}:`, error);
-            throw new Error(`Blocking failed: ${error.message}`);
+            throw error;
         }
     }
 
     async blockUser(uid, reason, duration = this.blockDuration) {
         try {
-            // Check if already blocked
             if (await this.isUserBlocked(uid)) {
                 console.log(`ℹ️ User ${uid} is already blocked`);
                 return false;
@@ -158,7 +110,6 @@ class IPSService {
 
             const expiresAt = new Date(Date.now() + duration);
 
-            // Update user document in Firestore
             await db.collection('users_ips').doc(uid).update({
                 blocked: true,
                 blockReason: reason,
@@ -166,29 +117,21 @@ class IPSService {
                 blockedAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            // Update in-memory store
-            this.ipStore.blockedUsers[uid] = expiresAt.getTime();
-            if (this.ipStore.users[uid]) {
-                this.ipStore.users[uid].blocked = true;
-            }
-
-            // Also block the user's current IP if available
             const userDoc = await db.collection('users_ips').doc(uid).get();
             if (userDoc.exists && userDoc.data().ip) {
                 await this.blockIP(userDoc.data().ip, `User ${uid} blocked: ${reason}`, duration);
             }
 
-            console.log(`✅ Successfully blocked user: ${uid} until ${expiresAt}`);
+            console.log(`✅ Successfully blocked user: ${uid}`);
             return true;
         } catch (error) {
             console.error(`❌ Failed to block user ${uid}:`, error);
-            throw new Error(`User blocking failed: ${error.message}`);
+            throw error;
         }
     }
 
     async unblockIP(ip) {
         try {
-            // Update Snort rules
             let blacklist = await fs.readFile(this.blacklistPath, 'utf-8');
             const updatedRules = blacklist.replace(new RegExp(`drop ip ${ip} .*?\\n`, 'g'), '');
             
@@ -196,7 +139,6 @@ class IPSService {
                 await fs.writeFile(this.blacklistPath, updatedRules);
             }
 
-            // Update Firestore
             const snapshot = await db.collection('ips_blocklist')
                 .where('ip', '==', ip)
                 .where('active', '==', true)
@@ -210,29 +152,19 @@ class IPSService {
                 });
             });
             
-            if (!snapshot.empty) {
-                await batch.commit();
-            }
-
-            // Update in-memory store
-            delete this.ipStore.blockedIPs[ip];
-
-            console.log(`✅ Successfully unblocked IP: ${ip}`);
+            await batch.commit();
             return true;
         } catch (error) {
             console.error(`❌ Error unblocking IP ${ip}:`, error);
-            throw new Error(`Failed to unblock IP: ${error.message}`);
+            throw error;
         }
     }
 
     async unblockUser(uid) {
         try {
             const userDoc = await db.collection('users_ips').doc(uid).get();
-            if (!userDoc.exists) {
-                return false;
-            }
+            if (!userDoc.exists) return false;
 
-            // Update Firestore
             await db.collection('users_ips').doc(uid).update({
                 blocked: false,
                 blockReason: null,
@@ -240,13 +172,6 @@ class IPSService {
                 unblocked: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            // Update in-memory store
-            delete this.ipStore.blockedUsers[uid];
-            if (this.ipStore.users[uid]) {
-                this.ipStore.users[uid].blocked = false;
-            }
-
-            // Also unblock the user's IP if it was only blocked because of the user
             const userData = userDoc.data();
             if (userData.ip) {
                 const ipBlocks = await db.collection('ips_blocklist')
@@ -264,7 +189,7 @@ class IPSService {
             return true;
         } catch (error) {
             console.error(`❌ Error unblocking user ${uid}:`, error);
-            throw new Error(`Failed to unblock user: ${error.message}`);
+            throw error;
         }
     }
 
