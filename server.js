@@ -7,7 +7,7 @@ const ipsRoutes = require('./routes/ipsRoutes');
 const idsRoutes = require('./routes/idsRoutes');
 const ipsService = require('./services/ipsService'); // Add this import
 require('dotenv').config(); 
-const ipStore = require('./config/ipStore');
+
 
 // Configuration 
 const API_KEY = process.env.API_KEY;
