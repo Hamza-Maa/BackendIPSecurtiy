@@ -311,68 +311,90 @@ class IPSService {
     try {
         const now = new Date();
         let cleanedCount = 0;
+        console.log('⏳ Starting cleanup of expired blocks...');
 
         // Clean expired IP blocks
-        const ipSnapshot = await db.collection('ips_blocklist')
+        const ipQuery = db.collection('ips_blocklist')
             .where('active', '==', true)
-            .where('expiresAt', '<=', now)
-            .get();
+            .where('expiresAt', '<=', now);
 
-        const ipBatch = db.batch();
-        ipSnapshot.forEach(doc => {
-            ipBatch.update(doc.ref, { 
-                active: false,
-                unblocked: admin.firestore.FieldValue.serverTimestamp()
-            });
-            cleanedCount++;
-        });
+        const ipSnapshot = await ipQuery.get();
+        console.log(`🔍 Found ${ipSnapshot.size} expired IP blocks to clean`);
 
         if (!ipSnapshot.empty) {
-            await ipBatch.commit();
-            
-            // Only try to update Snort rules if the file exists
-            try {
-                let currentRules = '';
-                if (fs.existsSync(this.blacklistPath)) {
-                    currentRules = await fs.readFile(this.blacklistPath, 'utf-8');
-                    let updatedRules = currentRules;
-                    
-                    ipSnapshot.forEach(doc => {
-                        const ip = doc.data().ip;
-                        updatedRules = updatedRules.replace(new RegExp(`drop ip ${ip} .*?\\n`, 'g'), '');
-                    });
+            const ipBatch = db.batch();
+            ipSnapshot.forEach(doc => {
+                ipBatch.update(doc.ref, { 
+                    active: false,
+                    unblocked: admin.firestore.FieldValue.serverTimestamp()
+                });
+                cleanedCount++;
+            });
 
-                    if (updatedRules !== currentRules) {
-                        await fs.writeFile(this.blacklistPath, updatedRules);
+            try {
+                await ipBatch.commit();
+                console.log('✅ Successfully cleaned expired IP blocks');
+            } catch (batchError) {
+                console.error('❌ Failed to commit IP batch update:', batchError);
+                throw batchError;
+            }
+
+            // Handle blacklist rules if needed
+            if (this.blacklistPath) {
+                try {
+                    if (await fs.access(this.blacklistPath).then(() => true).catch(() => false)) {
+                        let currentRules = await fs.readFile(this.blacklistPath, 'utf-8');
+                        let updatedRules = currentRules;
+                        
+                        ipSnapshot.forEach(doc => {
+                            const ip = doc.data().ip;
+                            updatedRules = updatedRules.replace(new RegExp(`drop ip ${ip} .*?\\n`, 'g'), '');
+                        });
+
+                        if (updatedRules !== currentRules) {
+                            await fs.writeFile(this.blacklistPath, updatedRules);
+                            console.log('📝 Updated blacklist rules file');
+                        }
                     }
+                } catch (fileError) {
+                    console.warn('⚠️ Could not update blacklist rules:', fileError);
                 }
-            } catch (fileError) {
-                console.warn('⚠️ Could not update blacklist rules:', fileError);
             }
         }
 
         // Clean expired user blocks
-        const userSnapshot = await db.collection('users_ips')
+        const userQuery = db.collection('users_ips')
             .where('blocked', '==', true)
-            .where('blockUntil', '<=', now)
-            .get();
+            .where('blockUntil', '<=', now);
 
-        const userBatch = db.batch();
-        userSnapshot.forEach(doc => {
-            userBatch.update(doc.ref, { 
-                blocked: false,
-                blockReason: null,
-                blockUntil: null,
-                unblocked: admin.firestore.FieldValue.serverTimestamp()
-            });
-            cleanedCount++;
-        });
+        const userSnapshot = await userQuery.get();
+        console.log(`🔍 Found ${userSnapshot.size} expired user blocks to clean`);
 
         if (!userSnapshot.empty) {
-            await userBatch.commit();
+            const userBatch = db.batch();
+            userSnapshot.forEach(doc => {
+                userBatch.update(doc.ref, { 
+                    blocked: false,
+                    blockReason: null,
+                    blockUntil: null,
+                    unblocked: admin.firestore.FieldValue.serverTimestamp()
+                });
+                cleanedCount++;
+            });
+
+            try {
+                await userBatch.commit();
+                console.log('✅ Successfully cleaned expired user blocks');
+            } catch (batchError) {
+                console.error('❌ Failed to commit user batch update:', batchError);
+                throw batchError;
+            }
         }
 
         // Clean in-memory stores
+        const initialIPCount = Object.keys(this.ipStore.blockedIPs).length;
+        const initialUserCount = Object.keys(this.ipStore.blockedUsers).length;
+        
         Object.keys(this.ipStore.blockedIPs).forEach(ip => {
             if (this.ipStore.blockedIPs[ip] <= now) {
                 delete this.ipStore.blockedIPs[ip];
@@ -388,11 +410,11 @@ class IPSService {
             }
         });
 
-        console.log(`🧹 Cleaned ${cleanedCount} expired blocks`);
+        console.log(`🧹 Cleaned ${cleanedCount} expired blocks (${initialIPCount - Object.keys(this.ipStore.blockedIPs).length} IPs, ${initialUserCount - Object.keys(this.ipStore.blockedUsers).length} users)`);
         return cleanedCount;
     } catch (error) {
         console.error('❌ Error cleaning up expired blocks:', error);
-        throw new Error('Failed to clean up expired blocks');
+        throw new Error(`Failed to clean up expired blocks: ${error.message}`);
     }
 }
 }
