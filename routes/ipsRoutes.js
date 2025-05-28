@@ -13,21 +13,41 @@ router.post("/block", async (req, res) => {
     }
 
     try {
-        // Block in both systems
-        await ipsService.blockIP(ip, reason, duration);
-        
+        // First validate the IP
+        if (ip === '::1' || ip === '127.0.0.1') {
+            return res.status(400).send("Cannot block localhost IP");
+        }
+
+        // Calculate block duration (default to 1 hour)
+        const blockDuration = duration ? parseInt(duration) : 3600000;
+        const expiresAt = Date.now() + blockDuration;
+
+        // Block in Firestore
+        const geo = geoip.lookup(ip);
+        await db.collection('ips_blocklist').add({
+            ip,
+            reason,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt: new Date(expiresAt),
+            geo: geo || null,
+            active: true
+        });
+
         // Also add to in-memory store
-        const blockDuration = duration || ipsService.blockDuration;
-        ipStore.blockedIPs[ip] = Date.now() + blockDuration;
+        ipStore.blockedIPs[ip] = expiresAt;
         
         res.status(200).json({
-            message: `✅ IP ${ip} blocked`,
+            message: `✅ IP ${ip} blocked successfully`,
             reason,
-            duration: blockDuration
+            duration: blockDuration,
+            expiresAt: new Date(expiresAt)
         });
     } catch (error) {
         console.error("Failed to block IP:", error);
-        res.status(500).send("❌ Error blocking IP");
+        res.status(500).json({
+            error: "Failed to block IP",
+            details: error.message
+        });
     }
 });
 
