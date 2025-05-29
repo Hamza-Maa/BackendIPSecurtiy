@@ -1,12 +1,11 @@
 const admin = require('firebase-admin');
 const geoip = require('geoip-lite');
-const ipStore = require('../config/ipStore');
 const express = require("express");
 const { db } = require("../config/firebase");
 const ipsService = require("../services/ipsService");
 const router = express.Router();
 
-// Block an IP address
+// Block an IP address (persistent in Firestore only)
 router.post("/block", async (req, res) => {
     const { ip, reason, duration } = req.body;
     
@@ -34,12 +33,9 @@ router.post("/block", async (req, res) => {
             geo: geo || null,
             active: true
         });
-
-        // Also add to in-memory store
-        ipStore.blockedIPs[ip] = expiresAt;
         
         res.status(200).json({
-            message: `✅ IP ${ip} blocked successfully`,
+            message: `✅ IP ${ip} blocked successfully in Firestore`,
             reason,
             duration: blockDuration,
             expiresAt: new Date(expiresAt)
@@ -53,7 +49,7 @@ router.post("/block", async (req, res) => {
     }
 });
 
-// Block by user ID (using their stored IP)
+// Block by user ID (persistent in Firestore only)
 router.post("/block-user", async (req, res) => {
     const { uid, reason, duration } = req.body;
     
@@ -69,12 +65,33 @@ router.post("/block-user", async (req, res) => {
         }
         
         const userIP = userDoc.data().ip;
-        await ipsService.blockIP(userIP, reason, duration);
+        const blockDuration = duration ? parseInt(duration) : 3600000;
+        const expiresAt = new Date(Date.now() + blockDuration);
+
+        // Block user in Firestore
+        await db.collection('users_ips').doc(uid).update({
+            blocked: true,
+            blockReason: reason,
+            blockUntil: expiresAt,
+            blockedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Also block the IP in Firestore
+        const geo = geoip.lookup(userIP);
+        await db.collection('ips_blocklist').add({
+            ip: userIP,
+            reason: `User ${uid} blocked: ${reason}`,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt: expiresAt,
+            geo: geo || null,
+            active: true
+        });
         
         res.status(200).json({
-            message: `✅ User ${uid} (IP: ${userIP}) blocked`,
+            message: `✅ User ${uid} (IP: ${userIP}) blocked in Firestore`,
             reason,
-            duration: duration || 'default'
+            duration: blockDuration,
+            expiresAt
         });
     } catch (error) {
         console.error("Failed to block user:", error);
@@ -82,7 +99,7 @@ router.post("/block-user", async (req, res) => {
     }
 });
 
-// Unblock an IP address
+// Unblock an IP address (persistent in Firestore only)
 router.delete("/unblock", async (req, res) => {
     const { ip } = req.body;
     
@@ -91,18 +108,41 @@ router.delete("/unblock", async (req, res) => {
     }
 
     try {
-        await ipsService.unblockIP(ip);
-        res.status(200).send(`✅ IP ${ip} unblocked`);
+        // Mark as inactive in Firestore
+        const snapshot = await db.collection('ips_blocklist')
+            .where('ip', '==', ip)
+            .where('active', '==', true)
+            .get();
+
+        const batch = db.batch();
+        snapshot.forEach(doc => {
+            batch.update(doc.ref, { 
+                active: false,
+                unblocked: admin.firestore.FieldValue.serverTimestamp()
+            });
+        });
+        
+        await batch.commit();
+        res.status(200).send(`✅ IP ${ip} unblocked in Firestore`);
     } catch (error) {
         console.error("Failed to unblock IP:", error);
         res.status(500).send("❌ Error unblocking IP");
     }
 });
 
-// Get list of blocked IPs
+// Get list of blocked IPs (from Firestore only)
 router.get("/blocked", async (req, res) => {
     try {
-        const blockedIPs = await ipsService.getBlockedIPs();
+        const snapshot = await db.collection('ips_blocklist')
+            .where('active', '==', true)
+            .get();
+
+        const blockedIPs = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data(),
+            expiresAt: doc.data().expiresAt.toDate()
+        }));
+        
         res.status(200).json(blockedIPs);
     } catch (error) {
         console.error("Failed to get blocked IPs:", error);
@@ -110,64 +150,73 @@ router.get("/blocked", async (req, res) => {
     }
 });
 
-// Get suspicious activity logs
-router.get("/suspicious", async (req, res) => {
+// Get blocked users (from Firestore only)
+router.get("/blocked-users", async (req, res) => {
     try {
-        const options = {
-            limit: parseInt(req.query.limit) || 100,
-            ip: req.query.ip
-        };
+        const snapshot = await db.collection('users_ips')
+            .where('blocked', '==', true)
+            .get();
 
-        const activity = await ipsService.getSuspiciousActivity(options);
-        res.status(200).json(activity);
+        const blockedUsers = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data(),
+            blockUntil: doc.data().blockUntil?.toDate()
+        }));
+        
+        res.status(200).json(blockedUsers);
     } catch (error) {
-        console.error("Failed to get suspicious activity:", error);
-        res.status(500).send("❌ Error getting suspicious activity");
+        console.error("Failed to get blocked users:", error);
+        res.status(500).send("❌ Error getting blocked users");
     }
 });
 
-// Force cleanup of expired blocks
+// Force cleanup of expired blocks (Firestore only)
 router.post("/cleanup", async (req, res) => {
     try {
-        const cleanedCount = await ipsService.cleanupExpiredBlocks();
+        const now = new Date();
+        let cleanedCount = 0;
+
+        // Clean expired IP blocks
+        const ipQuery = db.collection('ips_blocklist')
+            .where('active', '==', true)
+            .where('expiresAt', '<=', now);
+
+        const ipSnapshot = await ipQuery.get();
+        const ipBatch = db.batch();
+        ipSnapshot.forEach(doc => {
+            ipBatch.update(doc.ref, { 
+                active: false,
+                unblocked: admin.firestore.FieldValue.serverTimestamp()
+            });
+            cleanedCount++;
+        });
+        await ipBatch.commit();
+
+        // Clean expired user blocks
+        const userQuery = db.collection('users_ips')
+            .where('blocked', '==', true)
+            .where('blockUntil', '<=', now);
+
+        const userSnapshot = await userQuery.get();
+        const userBatch = db.batch();
+        userSnapshot.forEach(doc => {
+            userBatch.update(doc.ref, { 
+                blocked: false,
+                blockReason: null,
+                blockUntil: null,
+                unblocked: admin.firestore.FieldValue.serverTimestamp()
+            });
+            cleanedCount++;
+        });
+        await userBatch.commit();
+
         res.status(200).json({
-            message: "✅ Cleanup completed",
+            message: "✅ Cleanup completed in Firestore",
             cleanedCount
         });
     } catch (error) {
         console.error("Failed to cleanup expired blocks:", error);
         res.status(500).send("❌ Error cleaning up expired blocks");
-    }
-});
-
-// Get IPS statistics
-router.get("/stats", async (req, res) => {
-    try {
-        const [blockedIPs, suspiciousActivity] = await Promise.all([
-            ipsService.getBlockedIPs(),
-            ipsService.getSuspiciousActivity({ limit: 1000 })
-        ]);
-
-        // Calculate statistics
-        const stats = {
-            activeBlocks: blockedIPs.length,
-            suspiciousActivities: suspiciousActivity.length,
-            byCountry: {},
-            recentBlocks: blockedIPs.slice(0, 10),
-            recentSuspiciousActivity: suspiciousActivity.slice(0, 10)
-        };
-
-        // Group blocked IPs by country
-        blockedIPs.forEach(block => {
-            if (block.geo && block.geo.country) {
-                stats.byCountry[block.geo.country] = (stats.byCountry[block.geo.country] || 0) + 1;
-            }
-        });
-
-        res.status(200).json(stats);
-    } catch (error) {
-        console.error("Failed to get IPS statistics:", error);
-        res.status(500).send("❌ Error getting IPS statistics");
     }
 });
 
